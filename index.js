@@ -49,6 +49,9 @@ const server = http.createServer(async (req, res) => {
       return res.end('Bad Request');
     }
 
+    // DEBUG: log every incoming event
+    process.stderr.write(`[DEBUG] db=${event.database} table=${event.table} type=${event.type} id=${event.data?.id}\n`);
+
     try {
       await processEvent(event);
       res.writeHead(200);
