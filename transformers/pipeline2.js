@@ -4,19 +4,19 @@
  */
 
 function clients(data) {
-  // crm.tenants only has: source, source_id, name, status, tier
+  // callbox_pipeline2.clients PK = client_id, status = x
   const statusMap = {
-    active: 'active', inactive: 'inactive', suspended: 'suspended',
-    churned: 'churned', prospect: 'prospect',
+    active: 'active', inactive: 'inactive',
+    onhold: 'inactive', deleted: 'churned',
   };
   return {
     schema: 'crm',
     table: 'tenants',
     record: {
       source: 'mysql',
-      source_id: String(data.id),
-      name: data.name ?? 'Unknown',
-      status: statusMap[data.status] ?? 'active',
+      source_id: String(data.client_id),
+      name: data.campaign_name ?? data.referred_by ?? `Client #${data.client_id}`,
+      status: statusMap[data.x] ?? 'active',
     },
   };
 }

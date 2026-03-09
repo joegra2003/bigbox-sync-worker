@@ -68,7 +68,7 @@ async function main() {
         processed++;
       } catch (err) {
         errors++;
-        console.error(`Error on id=${row.id}: ${err.message}`);
+        console.error(`Error on client_id=${row.client_id}: ${err.message}`);
       }
     }
     offset += BATCH_SIZE;
