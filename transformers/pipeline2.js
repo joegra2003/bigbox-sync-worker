@@ -4,21 +4,19 @@
  */
 
 function clients(data) {
+  // crm.tenants only has: source, source_id, name, status, tier
+  const statusMap = {
+    active: 'active', inactive: 'inactive', suspended: 'suspended',
+    churned: 'churned', prospect: 'prospect',
+  };
   return {
     schema: 'crm',
     table: 'tenants',
     record: {
       source: 'mysql',
       source_id: String(data.id),
-      name: data.name ?? null,
-      email: data.email ?? null,
-      phone: data.phone ?? null,
-      address: data.address ?? null,
-      city: data.city ?? null,
-      state: data.state ?? null,
-      zip: data.zip ?? null,
-      country: data.country ?? null,
-      status: data.status ?? null,
+      name: data.name ?? 'Unknown',
+      status: statusMap[data.status] ?? 'active',
     },
   };
 }
