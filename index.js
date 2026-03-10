@@ -33,9 +33,8 @@ async function processEvent(event) {
       continue;
     }
 
-    // Two-step write: if target needs activity_id from a prior upsert
+    // Two-step write: outreach needs activity_id from prior activities upsert
     if (target.__depends_on_activity) {
-      // Find the activity that was just upserted (same source_id)
       const activityRes = await pg.query(
         `SELECT id FROM crm.activities
          WHERE source = 'pipeline2' AND source_id = $1
@@ -45,8 +44,26 @@ async function processEvent(event) {
       if (activityRes.rows.length) {
         target.record.activity_id = activityRes.rows[0].id;
       }
-      // Remove internal signal before upsert
       delete target.__depends_on_activity;
+    }
+
+    // Two-step write: campaign_lists junction needs list_id from prior lists upsert
+    if (target.__depends_on_list) {
+      // source_id on junction is `cl-{client_list_id}` — strip prefix to get list source_id
+      const listSourceId = target.record.source_id.replace(/^cl-/, '');
+      const listRes = await pg.query(
+        `SELECT id FROM crm.lists
+         WHERE source = 'pipeline2' AND source_id = $1
+         LIMIT 1`,
+        [listSourceId]
+      );
+      if (listRes.rows.length) {
+        target.record.list_id = listRes.rows[0].id;
+      } else {
+        logger.warn('list not found for campaign_lists junction', { listSourceId });
+        continue; // skip junction if list not found
+      }
+      delete target.__depends_on_list;
     }
 
     await upsert(target);

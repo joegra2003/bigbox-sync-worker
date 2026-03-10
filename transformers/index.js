@@ -11,7 +11,11 @@ const ROUTES = {
     contract_quotes:      pipeline2.contract_quotes,
     contracts_signature:  pipeline2.contracts_signature,
     employees:            pipeline2.employees,
-    // async (G3, G5)
+    // async — campaign chain
+    client_job_orders:    pipeline2.client_job_orders,
+    client_accounts:      pipeline2.client_accounts,
+    client_lists:         pipeline2.client_lists,
+    // async — G3, G5
     client_list_details:  pipeline2.client_list_details,
     events_tm_ob_txn:     pipeline2.events_tm_ob_txn,
   },

@@ -121,6 +121,185 @@ function employees(data) {
   ];
 }
 
+// ─── CAMPAIGN CHAIN: contracts → campaigns → lists → campaign_lists ──────────
+
+/**
+ * client_job_orders → crm.contracts
+ * Async: needs tenant lookup via client_account → client → crm.tenants
+ */
+async function client_job_orders(data, { pg, mysql }) {
+  const {
+    client_job_order_id,
+    client_account_id,
+    job_order,
+    contract_type,
+    contract_amount,
+    date_order,
+    x,
+  } = data;
+
+  // Map contract_type (legacy is outreach-specific — all map to 'prospect')
+  const contractTypeMap = {
+    'appointment setting': 'prospect',
+    'lead generation':     'prospect',
+    'sales':               'prospect',
+    'profiling':           'prospect',
+    'webinar':             'prospect',
+    'none':                'other',
+  };
+
+  // Map status
+  const statusMap = { active: 'active', inactive: 'ended', deleted: 'terminated' };
+
+  return {
+    schema: 'crm',
+    table: 'contracts',
+    record: {
+      contract_number: job_order ?? `JO-${client_job_order_id}`,
+      contract_type:   contractTypeMap[contract_type] ?? 'other',
+      status:          statusMap[x] ?? 'active',
+      job_order:       job_order ?? null,
+      contract_start:  date_order && date_order !== '0000-00-00' ? date_order : null,
+      source:          'pipeline2',
+      source_id:       String(client_job_order_id),
+    },
+  };
+}
+
+/**
+ * client_accounts → crm.campaigns
+ * Async: looks up tenant_id (via client_id → crm.tenants) and
+ * contract_id (via primary job order → crm.contracts).
+ */
+async function client_accounts(data, { pg, mysql }) {
+  const {
+    client_account_id,
+    client_id,
+    account_number,
+    campaign_start_date,
+    campaign_end_date,
+    x,
+  } = data;
+
+  // 1. Resolve tenant_id
+  const tenantRes = await pg.query(
+    `SELECT id FROM crm.tenants WHERE source = 'pipeline2' AND source_id = $1 LIMIT 1`,
+    [String(client_id)]
+  );
+  if (!tenantRes.rows.length) return null;
+  const tenant_id = tenantRes.rows[0].id;
+
+  // 2. Resolve contract_id — use the first (oldest) job order for this account
+  const [joRows] = await mysql.query(
+    `SELECT client_job_order_id FROM callbox_pipeline2.client_job_orders
+     WHERE client_account_id = ? AND x != 'deleted'
+     ORDER BY client_job_order_id ASC LIMIT 1`,
+    [client_account_id]
+  );
+  if (!joRows.length) return null; // no job order yet — skip
+  const contractRes = await pg.query(
+    `SELECT id FROM crm.contracts WHERE source = 'pipeline2' AND source_id = $1 LIMIT 1`,
+    [String(joRows[0].client_job_order_id)]
+  );
+  if (!contractRes.rows.length) return null; // contract not yet synced
+  const contract_id = contractRes.rows[0].id;
+
+  // 3. Map status
+  const statusMap = {
+    active:   'active',
+    inactive: 'ended',
+    onhold:   'on_hold',
+    deleted:  'suspended',
+  };
+
+  return {
+    schema: 'crm',
+    table: 'campaigns',
+    record: {
+      tenant_id,
+      contract_id,
+      name:       account_number ?? `Account #${client_account_id}`,
+      status:     statusMap[x] ?? 'active',
+      started_at: campaign_start_date ?? null,
+      ended_at:   campaign_end_date   ?? null,
+      source:     'pipeline2',
+      source_id:  String(client_account_id),
+    },
+  };
+}
+
+/**
+ * client_lists → crm.lists + crm.campaign_lists (junction)
+ * Async: needs campaign_id lookup via job_order → account → crm.campaigns
+ */
+async function client_lists(data, { pg, mysql }) {
+  const {
+    client_list_id,
+    list,
+    dynamic,
+    list_source,
+    client_job_order_id,
+    x,
+    date_time_created,
+  } = data;
+
+  // 1. Resolve campaign_id via job_order → client_account → crm.campaigns
+  const [joRows] = await mysql.query(
+    `SELECT client_account_id FROM callbox_pipeline2.client_job_orders
+     WHERE client_job_order_id = ? LIMIT 1`,
+    [client_job_order_id]
+  );
+  if (!joRows.length) return null;
+
+  const campaignRes = await pg.query(
+    `SELECT id FROM crm.campaigns WHERE source = 'pipeline2' AND source_id = $1 LIMIT 1`,
+    [String(joRows[0].client_account_id)]
+  );
+  if (!campaignRes.rows.length) return null;
+  const campaign_id = campaignRes.rows[0].id;
+
+  // 2. Resolve tenant_id from campaign
+  const tenantRes = await pg.query(
+    `SELECT tenant_id FROM crm.campaigns WHERE id = $1 LIMIT 1`,
+    [campaign_id]
+  );
+  if (!tenantRes.rows.length) return null;
+  const tenant_id = tenantRes.rows[0].tenant_id;
+
+  // 3. Map fields
+  const list_type   = dynamic === 'yes' ? 'dynamic' : 'static';
+  const statusMap   = { active: 'active', inactive: 'archived', deleted: 'archived' };
+  const list_status = statusMap[x] ?? 'active';
+
+  // Returns two writes: lists row, then campaign_lists junction
+  return [
+    {
+      schema: 'crm',
+      table:  'lists',
+      record: {
+        tenant_id,
+        name:      list ?? `List #${client_list_id}`,
+        list_type,
+        status:    list_status,
+        source:    list_source === 'client' ? 'client' : 'pipeline2',
+        source_id: String(client_list_id),
+        created_at: date_time_created ?? undefined,
+      },
+    },
+    {
+      schema: 'crm',
+      table:  'campaign_lists',
+      __depends_on_list: true,  // wire list_id after lists upsert
+      record: {
+        campaign_id,
+        list_role: 'target',
+        source:    'pipeline2',
+        source_id: `cl-${client_list_id}`, // unique junction key
+      },
+    },
+  ];
+}
+
 // ─── G3: client_list_details → crm.contacts ──────────────────────────────────
 
 /**
@@ -338,7 +517,11 @@ module.exports = {
   contract_quotes,
   contracts_signature,
   employees,
-  // async (G3, G5)
+  // async — campaign chain (unblocks G3)
+  client_job_orders,
+  client_accounts,
+  client_lists,
+  // async — G3, G5
   client_list_details,
   events_tm_ob_txn,
 };
