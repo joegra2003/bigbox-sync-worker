@@ -15,9 +15,12 @@
 import 'dotenv/config';
 import mysql from 'mysql2/promise';
 import pg    from 'pg';
-import pino  from 'pino';
 
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+const logger = {
+  info:  (...a) => console.log('[INFO]',  ...a),
+  error: (...a) => console.error('[ERR]',  ...a),
+  warn:  (...a) => console.warn('[WARN]',  ...a),
+};
 
 // ─── DB CONNECTIONS ───────────────────────────────────────────────────────────
 
