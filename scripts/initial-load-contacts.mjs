@@ -108,23 +108,36 @@ log.info(`Loaded ${peopleMap.size} people, ${campaignListMap.size} campaign list
 
 // ─── STEP 1: LOAD FUNNEL STAGE MAP FROM MYSQL ────────────────────────────────
 
+// Funnel stage map — try multiple DB locations, default to empty map if unavailable
 log.info('Loading event_state_lkp funnel stages from MySQL...');
 
-const [funnelRows] = await mysqlPool.query(`
-  SELECT event_tm_ob_txn_id, esl.funnel_stage
-  FROM callbox_pipeline2.events_tm_ob_txn txn
-  JOIN callbox_pipeline2.events_tm_ob_lkp lkp
-    ON lkp.event_tm_ob_lkp_id = txn.event_tm_ob_lkp_id
-  JOIN callbox_pipeline2.event_state_lkp esl
-    ON esl.event_state_lkp_id = lkp.event_state_lkp_id
-  WHERE esl.funnel_stage IS NOT NULL AND esl.funnel_stage != ''
-`);
+let funnelMap = new Map();
+const funnelDbs = ['callbox_pipeline2', 'callbox_misc'];
 
-// event_tm_ob_txn_id → funnel_stage (lowercase)
-const funnelMap = new Map(
-  funnelRows.map(r => [String(r.event_tm_ob_txn_id), r.funnel_stage.toLowerCase()])
-);
-log.info(`Loaded ${funnelMap.size} funnel stage mappings`);
+for (const db of funnelDbs) {
+  try {
+    const [funnelRows] = await mysqlPool.query(`
+      SELECT txn.event_tm_ob_txn_id, esl.funnel_stage
+      FROM ${db}.events_tm_ob_txn txn
+      JOIN ${db}.events_tm_ob_lkp lkp
+        ON lkp.event_tm_ob_lkp_id = txn.event_tm_ob_lkp_id
+      JOIN ${db}.event_state_lkp esl
+        ON esl.event_state_lkp_id = lkp.event_state_lkp_id
+      WHERE esl.funnel_stage IS NOT NULL AND esl.funnel_stage != ''
+    `);
+    funnelMap = new Map(
+      funnelRows.map(r => [String(r.event_tm_ob_txn_id), r.funnel_stage.toLowerCase()])
+    );
+    log.info(`Loaded ${funnelMap.size} funnel stage mappings from ${db}`);
+    break;
+  } catch (err) {
+    log.warn(`event_state_lkp not found in ${db}, trying next...`);
+  }
+}
+
+if (!funnelMap.size) {
+  log.warn('No funnel stage map loaded — all contacts will default to identification');
+}
 
 // ─── STEP 2: LOAD + TRANSFORM client_list_details ───────────────────────────
 
