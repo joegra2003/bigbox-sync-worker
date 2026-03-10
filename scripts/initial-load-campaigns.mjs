@@ -251,10 +251,10 @@ for (const lst of lists) {
     source:       lst.list_source === 'client' ? 'client' : 'pipeline2',
     source_id:    String(lst.client_list_id),
   };
-  const createdAt = lst.date_time_created ? new Date(lst.date_time_created) : null;
-  if (createdAt && !isNaN(createdAt.getTime()) && createdAt.getFullYear() > 1970) {
-    row.created_at = createdAt.toISOString();
-  }
+  // Always include created_at — batch rows must have identical column sets
+  const rawDate = lst.date_time_created ? new Date(lst.date_time_created) : null;
+  const validDate = rawDate && !isNaN(rawDate.getTime()) && rawDate.getFullYear() > 1970;
+  row.created_at = validDate ? rawDate.toISOString() : new Date().toISOString();
 
   listRows.push(row);
   listCampaignIndex.push(campaign.id);
