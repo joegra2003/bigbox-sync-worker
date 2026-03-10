@@ -59,6 +59,47 @@ async function upsert(schema, table, record, conflictKey = '(source, source_id)'
   return result.rows[0]?.id ?? null;
 }
 
+/**
+ * SELECT-then-INSERT for tables without a usable unique constraint.
+ * Looks up by source + source_id; inserts only if not found.
+ * Returns the existing or newly created id.
+ */
+async function insertIfNew(schema, table, record) {
+  // Check if already exists
+  const existing = await pgPool.query(
+    `SELECT id FROM ${schema}.${table} WHERE source = $1 AND source_id = $2 LIMIT 1`,
+    [record.source, record.source_id]
+  );
+  if (existing.rows.length) return existing.rows[0].id;
+
+  // Insert
+  const cols = Object.keys(record);
+  const vals = Object.values(record);
+  const ph   = cols.map((_, i) => `$${i + 1}`);
+  const sql  = `INSERT INTO ${schema}.${table} (${cols.join(', ')}) VALUES (${ph.join(', ')}) RETURNING id`;
+  const result = await pgPool.query(sql, vals);
+  return result.rows[0]?.id ?? null;
+}
+
+/**
+ * For junction tables (no source/source_id) — check by natural key before inserting.
+ */
+async function insertJunctionIfNew(schema, table, record, checkCols) {
+  const checks = checkCols.map((c, i) => `${c} = $${i + 1}`).join(' AND ');
+  const vals   = checkCols.map(c => record[c]);
+  const existing = await pgPool.query(
+    `SELECT id FROM ${schema}.${table} WHERE ${checks} LIMIT 1`, vals
+  );
+  if (existing.rows.length) return existing.rows[0].id;
+
+  const cols   = Object.keys(record);
+  const allVals = Object.values(record);
+  const ph     = cols.map((_, i) => `$${i + 1}`);
+  const sql    = `INSERT INTO ${schema}.${table} (${cols.join(', ')}) VALUES (${ph.join(', ')}) RETURNING id`;
+  const result = await pgPool.query(sql, allVals);
+  return result.rows[0]?.id ?? null;
+}
+
 // ─── STEP 1: client_job_orders → crm.contracts ───────────────────────────────
 
 logger.info('Step 1: loading client_job_orders → crm.contracts');
@@ -88,7 +129,7 @@ for (const jo of jobOrders) {
       contract_start:  jo.date_order && jo.date_order !== '0000-00-00' ? jo.date_order : null,
       source:          'pipeline2',
       source_id:       String(jo.client_job_order_id),
-    });
+    }, '(contract_number)');
     stats.contracts++;
   } catch (err) {
     logger.error({ err: err.message, id: jo.client_job_order_id }, 'contract upsert failed');
@@ -133,7 +174,7 @@ for (const acc of accounts) {
     if (!contractRes.rows.length) { stats.skipped++; continue; }
     const contract_id = contractRes.rows[0].id;
 
-    await upsert('crm', 'campaigns', {
+    await insertIfNew('crm', 'campaigns', {
       tenant_id,
       contract_id,
       name:       acc.account_number ?? `Account #${acc.client_account_id}`,
@@ -177,25 +218,25 @@ for (const lst of lists) {
     if (!campaignRes.rows.length) { stats.skipped++; continue; }
     const { id: campaign_id, tenant_id } = campaignRes.rows[0];
 
-    // Upsert list
-    const list_id = await upsert('crm', 'lists', {
+    // Insert list (SELECT-then-INSERT — no unique constraint on source/source_id)
+    const list_id = await insertIfNew('crm', 'lists', {
       tenant_id,
       name:      lst.list ?? `List #${lst.client_list_id}`,
       list_type: lst.dynamic === 'yes' ? 'dynamic' : 'static',
       status:    listStatusMap[lst.x] ?? 'active',
       source:    lst.list_source === 'client' ? 'client' : 'pipeline2',
       source_id: String(lst.client_list_id),
-      created_at: lst.date_time_created ?? undefined,
+      ...(lst.date_time_created ? { created_at: lst.date_time_created } : {}),
     });
     stats.lists++;
 
-    // Upsert campaign_lists junction
+    // Insert campaign_lists junction (check campaign_id + list_id)
     if (list_id) {
-      await upsert('crm', 'campaign_lists', {
+      await insertJunctionIfNew('crm', 'campaign_lists', {
         campaign_id,
         list_id,
         list_role: 'target',
-      }, '(campaign_id, list_id)');
+      }, ['campaign_id', 'list_id']);
       stats.campaign_lists++;
     }
   } catch (err) {
