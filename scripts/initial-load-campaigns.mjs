@@ -1,13 +1,21 @@
 /**
- * initial-load-campaigns.mjs
+ * initial-load-campaigns.mjs  (v2 — batch mode)
  *
  * Backfills the campaign chain into BigBox Supabase:
  *   client_job_orders → crm.contracts
  *   client_accounts   → crm.campaigns
  *   client_lists      → crm.lists + crm.campaign_lists
  *
- * Must run AFTER initial-load-all.mjs (tenants must exist).
- * Must complete BEFORE initial-load-contacts.mjs (contacts need campaign_list_id).
+ * Strategy:
+ *   1. Fetch all FK lookup maps from Supabase upfront (4 queries total)
+ *   2. Build all rows in memory
+ *   3. Batch INSERT 500 rows at a time with ON CONFLICT ... DO UPDATE
+ *
+ * Requires unique indexes (already applied):
+ *   crm.contracts     (source, source_id)
+ *   crm.campaigns     (source, source_id)
+ *   crm.lists         (source, source_id)
+ *   crm.campaign_lists (campaign_id, list_id)
  *
  * Run: MYSQL_USER=app_pipe MYSQL_PASSWORD=a33-pipe node scripts/initial-load-campaigns.mjs
  */
@@ -17,12 +25,13 @@ import mysql from 'mysql2/promise';
 import pg    from 'pg';
 
 const log = {
-  info:  (msg, meta = '') => console.log(`[INFO]  ${msg}`, meta ? JSON.stringify(meta) : ''),
-  error: (msg, meta = '') => console.error(`[ERR]   ${msg}`, meta ? JSON.stringify(meta) : ''),
-  warn:  (msg, meta = '') => console.warn(`[WARN]  ${msg}`, meta ? JSON.stringify(meta) : ''),
+  info:  (msg, meta) => console.log(`[INFO]  ${msg}`, meta != null ? JSON.stringify(meta) : ''),
+  error: (msg, meta) => console.error(`[ERR]   ${msg}`, meta != null ? JSON.stringify(meta) : ''),
 };
 
-// ─── DB CONNECTIONS ───────────────────────────────────────────────────────────
+const BATCH = 500;
+
+// ─── CONNECTIONS ──────────────────────────────────────────────────────────────
 
 const mysqlPool = await mysql.createPool({
   host:     process.env.MYSQL_HOST     || '127.0.0.1',
@@ -36,46 +45,85 @@ const mysqlPool = await mysql.createPool({
 
 const pgPool = new pg.Pool({ connectionString: process.env.SUPABASE_DB_URL });
 
-const stats = { contracts: 0, campaigns: 0, lists: 0, campaign_lists: 0, skipped: 0, errors: 0 };
+// ─── BATCH UPSERT ─────────────────────────────────────────────────────────────
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
+async function batchUpsert(schema, table, rows, conflictCols, updateCols) {
+  if (!rows.length) return 0;
+  let inserted = 0;
 
-/** SELECT-then-INSERT by source + source_id. Returns id. */
-async function insertIfNew(schema, table, record) {
-  const existing = await pgPool.query(
-    `SELECT id FROM ${schema}.${table} WHERE source = $1 AND source_id = $2 LIMIT 1`,
-    [record.source, record.source_id]
-  );
-  if (existing.rows.length) return existing.rows[0].id;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    const cols  = Object.keys(batch[0]);
+    const vals  = [];
+    const ph    = batch.map((row, ri) => {
+      const rowPh = cols.map((c, ci) => {
+        vals.push(row[c] ?? null);
+        return `$${ri * cols.length + ci + 1}`;
+      });
+      return `(${rowPh.join(', ')})`;
+    });
 
-  const cols   = Object.keys(record);
-  const vals   = Object.values(record);
-  const ph     = cols.map((_, i) => `$${i + 1}`);
-  const result = await pgPool.query(
-    `INSERT INTO ${schema}.${table} (${cols.join(', ')}) VALUES (${ph.join(', ')}) RETURNING id`,
-    vals
-  );
-  return result.rows[0]?.id ?? null;
+    const conflictClause = `(${conflictCols.join(', ')})`;
+    const updateClause   = updateCols
+      .map(c => `${c} = EXCLUDED.${c}`)
+      .concat(['updated_at = now()'])
+      .join(', ');
+
+    const sql = `
+      INSERT INTO ${schema}.${table} (${cols.join(', ')})
+      VALUES ${ph.join(', ')}
+      ON CONFLICT ${conflictClause} DO UPDATE SET ${updateClause}
+    `;
+
+    await pgPool.query(sql, vals);
+    inserted += batch.length;
+    log.info(`  ${schema}.${table}: ${inserted}/${rows.length}`);
+  }
+  return inserted;
 }
 
-/** SELECT-then-INSERT for junction tables without source/source_id. */
-async function insertJunctionIfNew(schema, table, record, checkCols) {
-  const whereParts = checkCols.map((c, i) => `${c} = $${i + 1}`).join(' AND ');
-  const checkVals  = checkCols.map(c => record[c]);
-  const existing   = await pgPool.query(
-    `SELECT id FROM ${schema}.${table} WHERE ${whereParts} LIMIT 1`, checkVals
-  );
-  if (existing.rows.length) return existing.rows[0].id;
+/** Batch INSERT for junction tables — ON CONFLICT DO NOTHING */
+async function batchInsertJunction(schema, table, rows, conflictCols) {
+  if (!rows.length) return 0;
+  let inserted = 0;
 
-  const cols   = Object.keys(record);
-  const vals   = Object.values(record);
-  const ph     = cols.map((_, i) => `$${i + 1}`);
-  const result = await pgPool.query(
-    `INSERT INTO ${schema}.${table} (${cols.join(', ')}) VALUES (${ph.join(', ')}) RETURNING id`,
-    vals
-  );
-  return result.rows[0]?.id ?? null;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    const cols  = Object.keys(batch[0]);
+    const vals  = [];
+    const ph    = batch.map((row, ri) => {
+      const rowPh = cols.map((c, ci) => {
+        vals.push(row[c] ?? null);
+        return `$${ri * cols.length + ci + 1}`;
+      });
+      return `(${rowPh.join(', ')})`;
+    });
+
+    const conflictClause = `(${conflictCols.join(', ')})`;
+    const sql = `
+      INSERT INTO ${schema}.${table} (${cols.join(', ')})
+      VALUES ${ph.join(', ')}
+      ON CONFLICT ${conflictClause} DO NOTHING
+    `;
+    await pgPool.query(sql, vals);
+    inserted += batch.length;
+  }
+  return inserted;
 }
+
+// ─── STEP 0: LOAD LOOKUP MAPS FROM SUPABASE ───────────────────────────────────
+
+log.info('Loading lookup maps from Supabase...');
+
+const [tenantsRes, contractsRes] = await Promise.all([
+  pgPool.query(`SELECT source_id, id FROM crm.tenants WHERE source = 'pipeline2'`),
+  pgPool.query(`SELECT source_id, id FROM crm.contracts WHERE source = 'pipeline2'`),
+]);
+
+const tenantMap   = new Map(tenantsRes.rows.map(r => [r.source_id, r.id]));
+const contractMap = new Map(contractsRes.rows.map(r => [r.source_id, r.id]));
+
+log.info(`Loaded ${tenantMap.size} tenants, ${contractMap.size} existing contracts`);
 
 // ─── STEP 1: client_job_orders → crm.contracts ───────────────────────────────
 
@@ -87,30 +135,33 @@ const [jobOrders] = await mysqlPool.query(
 );
 log.info(`Found ${jobOrders.length} job orders`);
 
-const contractTypeMap = {
+const contractTypeMap  = {
   'appointment setting': 'prospect', 'lead generation': 'prospect',
   'sales': 'prospect', 'profiling': 'prospect', 'webinar': 'prospect', 'none': 'other',
 };
 const contractStatusMap = { active: 'active', inactive: 'ended', deleted: 'terminated' };
 
-for (const jo of jobOrders) {
-  try {
-    await insertIfNew('crm', 'contracts', {
-      contract_number: jo.job_order ?? `JO-${jo.client_job_order_id}`,
-      contract_type:   contractTypeMap[jo.contract_type] ?? 'other',
-      status:          contractStatusMap[jo.x] ?? 'active',
-      contract_start:  jo.date_order && jo.date_order !== '0000-00-00' ? jo.date_order : null,
-      source:          'pipeline2',
-      source_id:       String(jo.client_job_order_id),
-    });
-    stats.contracts++;
-    if (stats.contracts % 500 === 0) log.info(`contracts: ${stats.contracts}`);
-  } catch (err) {
-    log.error(`contract failed id=${jo.client_job_order_id}`, { err: err.message });
-    stats.errors++;
-  }
-}
-log.info(`Step 1 done`, { contracts: stats.contracts, errors: stats.errors });
+const contractRows = jobOrders.map(jo => ({
+  contract_number: jo.job_order ?? `JO-${jo.client_job_order_id}`,
+  contract_type:   contractTypeMap[jo.contract_type] ?? 'other',
+  status:          contractStatusMap[jo.x] ?? 'active',
+  contract_start:  jo.date_order && jo.date_order !== '0000-00-00' ? jo.date_order : null,
+  source:          'pipeline2',
+  source_id:       String(jo.client_job_order_id),
+}));
+
+const contractsInserted = await batchUpsert(
+  'crm', 'contracts', contractRows,
+  ['source', 'source_id'],
+  ['contract_number', 'contract_type', 'status', 'contract_start']
+);
+log.info('Step 1 done', { contracts: contractsInserted });
+
+// Reload contract map with freshly inserted rows
+const contractsRes2 = await pgPool.query(
+  `SELECT source_id, id FROM crm.contracts WHERE source = 'pipeline2'`
+);
+const contractMapFull = new Map(contractsRes2.rows.map(r => [r.source_id, r.id]));
 
 // ─── STEP 2: client_accounts → crm.campaigns ─────────────────────────────────
 
@@ -129,47 +180,43 @@ const [accounts] = await mysqlPool.query(
 log.info(`Found ${accounts.length} accounts`);
 
 const campaignStatusMap = { active: 'active', inactive: 'ended', onhold: 'on_hold', deleted: 'suspended' };
+let skippedCampaigns = 0;
 
+const campaignRows = [];
 for (const acc of accounts) {
-  try {
-    // Resolve tenant_id
-    const tenantRes = await pgPool.query(
-      `SELECT id FROM crm.tenants WHERE source = 'pipeline2' AND source_id = $1 LIMIT 1`,
-      [String(acc.client_id)]
-    );
-    if (!tenantRes.rows.length) { stats.skipped++; continue; }
-    const tenant_id = tenantRes.rows[0].id;
+  const tenant_id = tenantMap.get(String(acc.client_id));
+  if (!tenant_id) { skippedCampaigns++; continue; }
 
-    // Resolve contract_id (nullable in live DB — skip gracefully if not found)
-    let contract_id = null;
-    if (acc.primary_job_order_id) {
-      const contractRes = await pgPool.query(
-        `SELECT id FROM crm.contracts WHERE source = 'pipeline2' AND source_id = $1 LIMIT 1`,
-        [String(acc.primary_job_order_id)]
-      );
-      if (contractRes.rows.length) contract_id = contractRes.rows[0].id;
-    }
+  const contract_id = acc.primary_job_order_id
+    ? contractMapFull.get(String(acc.primary_job_order_id)) ?? null
+    : null;
 
-    const record = {
-      tenant_id,
-      name:       acc.account_number ?? `Account #${acc.client_account_id}`,
-      status:     campaignStatusMap[acc.x] ?? 'active',
-      source:     'pipeline2',
-      source_id:  String(acc.client_account_id),
-    };
-    if (contract_id)               record.contract_id  = contract_id;
-    if (acc.campaign_start_date)   record.started_at   = acc.campaign_start_date;
-    if (acc.campaign_end_date)     record.ended_at     = acc.campaign_end_date;
+  const row = {
+    tenant_id,
+    name:      acc.account_number ?? `Account #${acc.client_account_id}`,
+    status:    campaignStatusMap[acc.x] ?? 'active',
+    source:    'pipeline2',
+    source_id: String(acc.client_account_id),
+  };
+  if (contract_id)             row.contract_id  = contract_id;
+  if (acc.campaign_start_date) row.started_at   = acc.campaign_start_date;
+  if (acc.campaign_end_date)   row.ended_at     = acc.campaign_end_date;
 
-    await insertIfNew('crm', 'campaigns', record);
-    stats.campaigns++;
-    if (stats.campaigns % 200 === 0) log.info(`campaigns: ${stats.campaigns}`);
-  } catch (err) {
-    log.error(`campaign failed id=${acc.client_account_id}`, { err: err.message });
-    stats.errors++;
-  }
+  campaignRows.push(row);
 }
-log.info(`Step 2 done`, { campaigns: stats.campaigns, errors: stats.errors });
+
+const campaignsInserted = await batchUpsert(
+  'crm', 'campaigns', campaignRows,
+  ['source', 'source_id'],
+  ['name', 'status', 'contract_id', 'started_at', 'ended_at']
+);
+log.info('Step 2 done', { campaigns: campaignsInserted, skipped: skippedCampaigns });
+
+// Reload campaign map
+const campaignsRes = await pgPool.query(
+  `SELECT source_id, id, tenant_id FROM crm.campaigns WHERE source = 'pipeline2'`
+);
+const campaignMap = new Map(campaignsRes.rows.map(r => [r.source_id, { id: r.id, tenant_id: r.tenant_id }]));
 
 // ─── STEP 3: client_lists → crm.lists + crm.campaign_lists ───────────────────
 
@@ -177,8 +224,7 @@ log.info('Step 3: client_lists → crm.lists + crm.campaign_lists');
 
 const [lists] = await mysqlPool.query(
   `SELECT cl.client_list_id, cl.list, cl.dynamic, cl.list_source,
-          cl.client_job_order_id, cl.x, cl.date_time_created,
-          jo.client_account_id
+          cl.x, cl.date_time_created, jo.client_account_id
    FROM client_lists cl
    JOIN client_job_orders jo ON jo.client_job_order_id = cl.client_job_order_id
    WHERE cl.x != 'deleted'`
@@ -186,53 +232,65 @@ const [lists] = await mysqlPool.query(
 log.info(`Found ${lists.length} lists`);
 
 const listStatusMap = { active: 'active', inactive: 'archived', deleted: 'archived' };
+let skippedLists = 0;
+
+const listRows = [];
+const listCampaignIndex = []; // parallel array: campaign_id per list row
 
 for (const lst of lists) {
-  try {
-    // Resolve campaign
-    const campaignRes = await pgPool.query(
-      `SELECT id, tenant_id FROM crm.campaigns WHERE source = 'pipeline2' AND source_id = $1 LIMIT 1`,
-      [String(lst.client_account_id)]
-    );
-    if (!campaignRes.rows.length) { stats.skipped++; continue; }
-    const { id: campaign_id, tenant_id } = campaignRes.rows[0];
+  const campaign = campaignMap.get(String(lst.client_account_id));
+  if (!campaign) { skippedLists++; continue; }
 
-    // Insert list
-    const listRecord = {
-      tenant_id,
-      name:         lst.list ?? `List #${lst.client_list_id}`,
-      list_type:    lst.dynamic === 'yes' ? 'dynamic' : 'static',
-      status:       listStatusMap[lst.x] ?? 'active',
-      record_count: 0,
-      source:       lst.list_source === 'client' ? 'client' : 'pipeline2',
-      source_id:    String(lst.client_list_id),
-    };
-    if (lst.date_time_created) listRecord.created_at = lst.date_time_created;
+  const row = {
+    tenant_id:    campaign.tenant_id,
+    name:         lst.list ?? `List #${lst.client_list_id}`,
+    list_type:    lst.dynamic === 'yes' ? 'dynamic' : 'static',
+    status:       listStatusMap[lst.x] ?? 'active',
+    record_count: 0,
+    source:       lst.list_source === 'client' ? 'client' : 'pipeline2',
+    source_id:    String(lst.client_list_id),
+  };
+  if (lst.date_time_created) row.created_at = lst.date_time_created;
 
-    const list_id = await insertIfNew('crm', 'lists', listRecord);
-    stats.lists++;
+  listRows.push(row);
+  listCampaignIndex.push(campaign.id);
+}
 
-    // Insert campaign_lists junction
-    if (list_id) {
-      await insertJunctionIfNew('crm', 'campaign_lists', {
-        campaign_id,
-        list_id,
-        list_role: 'target',
-      }, ['campaign_id', 'list_id']);
-      stats.campaign_lists++;
-    }
+await batchUpsert(
+  'crm', 'lists', listRows,
+  ['source', 'source_id'],
+  ['name', 'list_type', 'status', 'record_count']
+);
+log.info(`lists inserted: ${listRows.length}, skipped: ${skippedLists}`);
 
-    if (stats.lists % 500 === 0) log.info(`lists: ${stats.lists}`);
-  } catch (err) {
-    log.error(`list failed id=${lst.client_list_id}`, { err: err.message });
-    stats.errors++;
+// Reload list map, build campaign_lists rows
+const listsRes = await pgPool.query(
+  `SELECT source_id, id FROM crm.lists WHERE source IN ('pipeline2','client')`
+);
+const listMap = new Map(listsRes.rows.map(r => [r.source_id, r.id]));
+
+const junctionRows = [];
+for (let i = 0; i < listRows.length; i++) {
+  const list_id    = listMap.get(listRows[i].source_id);
+  const campaign_id = listCampaignIndex[i];
+  if (list_id && campaign_id) {
+    junctionRows.push({ campaign_id, list_id, list_role: 'target' });
   }
 }
-log.info(`Step 3 done`, { lists: stats.lists, campaign_lists: stats.campaign_lists, errors: stats.errors });
+
+const junctionsInserted = await batchInsertJunction(
+  'crm', 'campaign_lists', junctionRows, ['campaign_id', 'list_id']
+);
+log.info('Step 3 done', { lists: listRows.length, campaign_lists: junctionsInserted });
 
 // ─── SUMMARY ──────────────────────────────────────────────────────────────────
 
-log.info('✅ Campaign chain load complete', stats);
+log.info('✅ Campaign chain load complete', {
+  contracts:      contractsInserted,
+  campaigns:      campaignsInserted,
+  lists:          listRows.length,
+  campaign_lists: junctionsInserted,
+});
 log.info('G3 (crm.contacts) is now unblocked — run initial-load-contacts.mjs next');
 
 await mysqlPool.end();
