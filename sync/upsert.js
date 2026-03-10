@@ -23,8 +23,10 @@ async function upsert({ schema, table, record }) {
 
   logger.debug('Upsert SQL', { schema, table, sql: sql.trim() });
 
-  await pool.query(sql, values);
-  logger.info('Upserted', { schema, table, source_id: record.source_id });
+  const result = await pool.query(sql + ' RETURNING id', values);
+  const id = result.rows[0]?.id ?? null;
+  logger.info('Upserted', { schema, table, source_id: record.source_id, id });
+  return id;
 }
 
 module.exports = { upsert };

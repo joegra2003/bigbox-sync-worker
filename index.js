@@ -1,33 +1,55 @@
-const http = require('node:http');
-const config = require('./config');
-const logger = require('./logger');
-const { transform } = require('./transformers');
-const { upsert } = require('./sync/upsert');
-const { softDelete } = require('./sync/delete');
+const http    = require('node:http');
+const config  = require('./config');
+const logger  = require('./logger');
+const pg      = require('./db');
+const mysql   = require('./mysql');
+const { transform }    = require('./transformers');
+const { upsert }       = require('./sync/upsert');
+const { softDelete }   = require('./sync/delete');
 const { logSyncError } = require('./errors/sync_errors');
 
 const PORT = process.env.PORT || 3001;
 
 async function processEvent(event) {
   const { database, table, type, data } = event;
-  const sourceId = data?.id ? String(data.id) : 'unknown';
+  const sourceId = data?.id
+    ?? data?.client_list_detail_id
+    ?? data?.event_tm_ob_txn_id
+    ?? 'unknown';
 
-  logger.info('Processing event', { database, table, type, source_id: sourceId });
+  logger.info('Processing event', { database, table, type, source_id: String(sourceId) });
 
-  const targets = transform(event);
-  if (!targets) return; // skipped (unknown table or Phase 2)
+  const targets = await transform(event, { pg, mysql });
+  if (!targets) return; // skipped
 
   for (const target of targets) {
     if (type === 'delete') {
       await softDelete({
-        schema: target.schema,
-        table: target.table,
-        source: 'mysql',
-        sourceId,
+        schema:   target.schema,
+        table:    target.table,
+        source:   'pipeline2',
+        sourceId: String(sourceId),
       });
-    } else {
-      await upsert(target);
+      continue;
     }
+
+    // Two-step write: if target needs activity_id from a prior upsert
+    if (target.__depends_on_activity) {
+      // Find the activity that was just upserted (same source_id)
+      const activityRes = await pg.query(
+        `SELECT id FROM crm.activities
+         WHERE source = 'pipeline2' AND source_id = $1
+         LIMIT 1`,
+        [target.record.source_id]
+      );
+      if (activityRes.rows.length) {
+        target.record.activity_id = activityRes.rows[0].id;
+      }
+      // Remove internal signal before upsert
+      delete target.__depends_on_activity;
+    }
+
+    await upsert(target);
   }
 }
 
@@ -49,8 +71,10 @@ const server = http.createServer(async (req, res) => {
       return res.end('Bad Request');
     }
 
-    // DEBUG: log every incoming event
-    process.stderr.write(`[DEBUG] db=${event.database} table=${event.table} type=${event.type} id=${event.data?.id}\n`);
+    process.stderr.write(
+      `[DEBUG] db=${event.database} table=${event.table} type=${event.type} ` +
+      `id=${event.data?.id ?? event.data?.client_list_detail_id ?? event.data?.event_tm_ob_txn_id}\n`
+    );
 
     try {
       await processEvent(event);
@@ -59,9 +83,9 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       logger.error('Failed to process event', { error: err.message, event });
       await logSyncError({
-        rawEvent: event,
+        rawEvent:     event,
         errorMessage: err.message,
-        tableName: event?.table,
+        tableName:    event?.table,
       }).catch(() => {});
       res.writeHead(500);
       res.end('Internal Server Error');

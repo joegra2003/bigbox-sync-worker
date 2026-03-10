@@ -1,31 +1,38 @@
 const pipeline2 = require('./pipeline2');
-const crm = require('./crm');
-const hubspot = require('./hubspot');
-const logger = require('../logger');
+const crm       = require('./crm');
+const hubspot   = require('./hubspot');
+const logger    = require('../logger');
 
 const ROUTES = {
   callbox_pipeline2: {
-    clients: pipeline2.clients,
-    contracts: pipeline2.contracts,
-    contract_quotes: pipeline2.contract_quotes,
-    contracts_signature: pipeline2.contracts_signature,
-    employees: pipeline2.employees,
+    // sync
+    clients:              pipeline2.clients,
+    contracts:            pipeline2.contracts,
+    contract_quotes:      pipeline2.contract_quotes,
+    contracts_signature:  pipeline2.contracts_signature,
+    employees:            pipeline2.employees,
+    // async (G3, G5)
+    client_list_details:  pipeline2.client_list_details,
+    events_tm_ob_txn:     pipeline2.events_tm_ob_txn,
   },
   callbox_crm: {
     accounts: crm.accounts,
-    users: crm.users,
+    users:    crm.users,
     campaigns: crm.campaigns,
   },
 };
 
 /**
  * Transform a Maxwell CDC event into one or more upsert targets.
- * Returns an array of { schema, table, record } or null if skipped.
+ *
+ * Sync transformers: return { schema, table, record } or array thereof.
+ * Async transformers: return Promise (receive { pg, mysql } as second arg).
+ *
+ * Returns array of targets, or null if skipped.
  */
-function transform(event) {
+async function transform(event, { pg, mysql } = {}) {
   const { database, table, data } = event;
 
-  // Phase 2 — skip HubSpot
   if (database === 'callbox_hubspot_reports') {
     hubspot.skip(table, data);
     return null;
@@ -43,8 +50,10 @@ function transform(event) {
     return null;
   }
 
-  const result = fn(data);
-  // Normalise to array (some transformers return multiple targets)
+  // Async transformers receive db connections; sync transformers ignore the arg
+  const result = await fn(data, { pg, mysql });
+  if (!result) return null;
+
   return Array.isArray(result) ? result : [result];
 }
 

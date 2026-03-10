@@ -46,17 +46,8 @@ function users(data) {
 }
 
 function campaigns(data) {
-  return {
-    schema: 'crm',
-    table: 'campaigns',
-    record: {
-      source: 'mysql',
-      source_id: String(data.id),
-      name: data.name ?? null,
-      status: data.status ?? null,
-      tenant_id: data.client_id ?? data.account_id ?? null,
-    },
-  };
+  // Multi-step: needs tenant lookup + creates list + campaign + campaign_list junction
+  return { _type: 'campaign_full', data };
 }
 
 module.exports = { accounts, users, campaigns };
