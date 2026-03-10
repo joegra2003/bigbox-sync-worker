@@ -3,16 +3,25 @@
  */
 
 function accounts(data) {
+  // callbox_crm.accounts = prospect companies → identity.orgs
+  // (NOT crm.tenants — that's for Callbox's paying clients only)
+  // phone/email/address live in identity.org_branches/person_channels (future enrichment)
+  const typeMap = {
+    'Private':      'company',
+    'Public':       'company',
+    'Government':   'government',
+    'Non-Profit':   'nonprofit',
+    'Agency':       'agency',
+  };
   return {
-    schema: 'crm',
-    table: 'tenants',
+    schema: 'identity',
+    table: 'orgs',
     record: {
-      source: 'mysql',
-      source_id: String(data.id),
-      name: data.name ?? data.company_name ?? null,
-      email: data.email ?? null,
-      phone: data.phone ?? null,
-      status: 'prospect',
+      source:      'crm',
+      source_id:   String(data.account_id ?? data.id),
+      name:        data.name ?? data.company_name ?? `Account #${data.account_id ?? data.id}`,
+      entity_type: typeMap[data.type] ?? 'unknown',
+      industry:    data.sic || null,
     },
   };
 }
