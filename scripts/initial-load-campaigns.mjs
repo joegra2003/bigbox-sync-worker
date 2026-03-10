@@ -116,7 +116,8 @@ async function batchInsertJunction(schema, table, rows, conflictCols) {
 log.info('Loading lookup maps from Supabase...');
 
 const [tenantsRes, contractsRes] = await Promise.all([
-  pgPool.query(`SELECT source_id, id FROM crm.tenants WHERE source = 'pipeline2'`),
+  // tenants loaded by initial-load-all.mjs used source='mysql'; CDC now uses 'pipeline2'
+  pgPool.query(`SELECT source_id, id FROM crm.tenants WHERE source IN ('pipeline2','mysql')`),
   pgPool.query(`SELECT source_id, id FROM crm.contracts WHERE source = 'pipeline2'`),
 ]);
 
@@ -250,7 +251,10 @@ for (const lst of lists) {
     source:       lst.list_source === 'client' ? 'client' : 'pipeline2',
     source_id:    String(lst.client_list_id),
   };
-  if (lst.date_time_created) row.created_at = lst.date_time_created;
+  const createdAt = lst.date_time_created ? new Date(lst.date_time_created) : null;
+  if (createdAt && !isNaN(createdAt.getTime()) && createdAt.getFullYear() > 1970) {
+    row.created_at = createdAt.toISOString();
+  }
 
   listRows.push(row);
   listCampaignIndex.push(campaign.id);
