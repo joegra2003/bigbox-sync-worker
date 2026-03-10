@@ -142,7 +142,7 @@ const contractTypeMap  = {
 const contractStatusMap = { active: 'active', inactive: 'ended', deleted: 'terminated' };
 
 const contractRows = jobOrders.map(jo => ({
-  contract_number: jo.job_order || `JO-${jo.client_job_order_id}`,
+  contract_number: `${jo.job_order || 'JO'}-${jo.client_job_order_id}`,
   contract_type:   contractTypeMap[jo.contract_type] ?? 'other',
   status:          contractStatusMap[jo.x] ?? 'active',
   contract_start:  jo.date_order && jo.date_order !== '0000-00-00' ? jo.date_order : null,
