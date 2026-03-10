@@ -85,7 +85,6 @@ for (const jo of jobOrders) {
       contract_number: jo.job_order ?? `JO-${jo.client_job_order_id}`,
       contract_type:   contractTypeMap[jo.contract_type] ?? 'other',
       status:          contractStatusMap[jo.x] ?? 'active',
-      job_order:       jo.job_order ?? null,
       contract_start:  jo.date_order && jo.date_order !== '0000-00-00' ? jo.date_order : null,
       source:          'pipeline2',
       source_id:       String(jo.client_job_order_id),

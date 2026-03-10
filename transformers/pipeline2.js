@@ -158,7 +158,6 @@ async function client_job_orders(data, { pg, mysql }) {
       contract_number: job_order ?? `JO-${client_job_order_id}`,
       contract_type:   contractTypeMap[contract_type] ?? 'other',
       status:          statusMap[x] ?? 'active',
-      job_order:       job_order ?? null,
       contract_start:  date_order && date_order !== '0000-00-00' ? date_order : null,
       source:          'pipeline2',
       source_id:       String(client_job_order_id),
